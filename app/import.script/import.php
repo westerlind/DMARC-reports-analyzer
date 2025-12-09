@@ -1,217 +1,308 @@
 <?php
 
-include 'import.conf.php';
+// Composer autoloader (for Webklex/php-imap and others)
+require_once __DIR__ . '/../../vendor/autoload.php';
 
-resetLog();
+use Webklex\PHPIMAP\ClientManager;
+
+// Always load config from the script's directory regardless of current working directory
+include __DIR__ . '/import.conf.php';
+
+// ---- Logging setup -------------------------------------------------------
+// Supported levels: 'error' (0), 'warn' (1), 'info' (2), 'debug' (3)
+// Configurable via import.conf.php and CLI flags (-q/--quiet, -v, -vv, --log-level=LEVEL, --log-file=PATH, --no-stdout)
+
+// Defaults if not provided by config
+if (!isset($logLevel)) { $logLevel = 'info'; }
+if (!isset($logFile)) { $logFile = __DIR__ . '/import.log'; }
+if (!isset($logToStdout)) { $logToStdout = true; }
+
+// Parse CLI flags to override logging options
+if (PHP_SAPI === 'cli') {
+    foreach ($argv as $arg) {
+        if ($arg === '-q' || $arg === '--quiet') { $logLevel = 'error'; }
+        if ($arg === '-v') { $logLevel = 'debug'; } // single -v => be verbose (debug)
+        if ($arg === '-vv') { $logLevel = 'debug'; }
+        if (strpos($arg, '--log-level=') === 0) { $logLevel = substr($arg, 12); }
+        if (strpos($arg, '--log-file=') === 0) { $logFile = substr($arg, 11); }
+        if ($arg === '--no-stdout') { $logToStdout = false; }
+    }
+}
+
+// internal numeric level
+$__LOG_LEVELS = ['error' => 0, 'warn' => 1, 'info' => 2, 'debug' => 3];
+$__LOG_LEVEL = $__LOG_LEVELS[strtolower((string)$logLevel)] ?? 2;
+
+resetLog($logFile);
+
+// Stats for final summary
+$STATS = [
+    'mode' => null,
+    'messages_seen' => 0,
+    'attachments_seen' => 0,
+    'xml_parsed' => 0,
+    'xml_failed' => 0,
+    'reports_inserted' => 0,
+    'reports_skipped_existing' => 0,
+    'records_inserted' => 0,
+    'messages_moved' => 0,
+    'errors' => 0,
+];
 
 try {
     $dbc = new PDO("mysql:dbname=$dbname;host=$dbhost", $dbuser, $dbpass);
 } catch (PDOException $e) {
-    die('Database connection failed: ' . $e->getMessage() . PHP_EOL);
+    log_error('Database connection failed: ' . $e->getMessage());
+    emitSummaryAndExit(1);
 }
 
 // if table doesn't exist, create one
 if ($dbc->query('show tables LIKE \'report\'')->fetch() === false) {
-    logMessage('Table report doesn\'t exist... Creating...');
+    log_info('Table report doesn\'t exist... Creating...');
     if (!createTableReport()) {
-        die('Couldn\'t create table \'report\'.');        
+        log_error('Couldn\'t create table \'report\'.');        
+        emitSummaryAndExit(1);
     }
 }
 
 // if table doesn't exist, create one
 if ($dbc->query('show tables LIKE \'rptrecord\'')->fetch() === false) {
-    logMessage('Table rptrecord doesn\'t exist... Creating...');
+    log_info('Table rptrecord doesn\'t exist... Creating...');
     if (!createTableRptrecord()) {
-        die('Couldn\'t create table \'rptrecord\'.');        
+        log_error('Couldn\'t create table \'rptrecord\'.');        
+        emitSummaryAndExit(1);
     }
 }
 
-set_time_limit(0); 
-/* try to connect */
-$hostname = '{' . $host . '}' . $folderInbox;
+set_time_limit(0);
 
-$inbox = imap_open($hostname,$username,$password) or die('Cannot connect to Email: ' . imap_last_error());
+if (!isset($source)) { $source = 'imap'; }
 
-$emails = imap_search($inbox, 'ALL');
-
-/* if any emails found, iterate through each email */
-if($emails) {
-
-    $count = 1;
-
-    /* put the newest emails on top */
-    rsort($emails);
-
-    /* for every email... */
-    foreach($emails as $email_number) 
-    {
-
-        /* get information specific to this email */
-        $overview = imap_fetch_overview($inbox,$email_number,0);
-        logMessage('Processing message...  Subject:"' . $overview[0]->subject . '"');
-        //$message = imap_fetchbody($inbox,$email_number,2);
-
-        /* get mail structure */
-        $structure = imap_fetchstructure($inbox, $email_number);
-        //var_dump($structure);
-        $attachments = array();
-
-        $attachments['body'] = array(
-            'is_attachment' => false,
-            'filename' => '',
-            'name' => '',
-            'attachment' => ''
-        );
-
-        /* if any attachments found... */
-        if($structure->ifdparameters) 
-        {
-            foreach($structure->dparameters as $object) 
-            {
-                if(strtolower($object->attribute) == 'filename') 
-                {
-                    $attachments['body']['is_attachment'] = true;
-                    $attachments['body']['filename'] = $object->value;
-                }
+if ($source === 'local') {
+    $STATS['mode'] = 'local';
+    log_info('Starting import in LOCAL mode');
+    log_debug('localPath=' . ($localPath ?? ''));    
+    // Local directory import mode: process .zip, .gz, .xml files from $localPath
+    if (!isset($localPath)) {
+        log_error('Local import path not configured. Set $localPath in import.conf.php');
+        emitSummaryAndExit(1);
+    }
+    if (!is_dir($localPath)) {
+        log_error('Local import path does not exist: ' . $localPath);
+        emitSummaryAndExit(1);
+    }
+    $dir = new DirectoryIterator($localPath);
+    foreach ($dir as $fileinfo) {
+        if ($fileinfo->isDot() || !$fileinfo->isFile()) continue;
+        $filename = $fileinfo->getFilename();
+        $lower = strtolower($filename);
+        $path = $fileinfo->getPathname();
+        log_info('Processing local file: ' . $filename);
+        $xmls = [];
+        if (substr($lower, -4) === '.xml') {
+            $xmlRaw = file_get_contents($path);
+            $xmls[] = [$xmlRaw, $filename];
+        } elseif (substr($lower, -3) === '.gz') {
+            $data = file_get_contents($path);
+            $xmlRaw = gzdecode($data);
+            if ($xmlRaw !== false) {
+                $xmls[] = [$xmlRaw, $filename];
             }
-        }
-
-        if($structure->ifparameters) 
-        {
-            foreach($structure->parameters as $object) 
-            {
-                if(strtolower($object->attribute) == 'name') 
-                {
-                    $attachments['body']['is_attachment'] = true;
-                    $attachments['body']['name'] = $object->value;
-                }
-            }
-        }
-
-        if($attachments['body']['is_attachment']) 
-        {
-            $attachments['body']['attachment'] = imap_fetchbody($inbox, $email_number,1);
-            
-            /* 3 = BASE64 encoding */
-            if($structure->encoding == 3) 
-            { 
-                $attachments['body']['attachment'] = base64_decode($attachments['body']['attachment']);
-            }
-            /* 4 = QUOTED-PRINTABLE encoding */
-            elseif($structure->encoding == 4) 
-            { 
-                $attachments['body']['attachment'] = quoted_printable_decode($attachments['body']['attachment']);
-            }
-        }
-
-        if(isset($structure->parts) && count($structure->parts)) 
-        {
-            for($i = 0; $i < count($structure->parts); $i++) 
-            {
-                $attachments[$i] = array(
-                    'is_attachment' => false,
-                    'filename' => '',
-                    'name' => '',
-                    'attachment' => ''
-                );
-
-                if($structure->parts[$i]->ifdparameters) 
-                {
-                    foreach($structure->parts[$i]->dparameters as $object) 
-                    {
-                        if(strtolower($object->attribute) == 'filename') 
-                        {
-                            $attachments[$i]['is_attachment'] = true;
-                            $attachments[$i]['filename'] = $object->value;
+        } elseif (substr($lower, -4) === '.zip') {
+            $zip = new ZipArchive();
+            if ($zip->open($path) === true) {
+                for ($i = 0; $i < $zip->numFiles; $i++) {
+                    $entryName = $zip->getNameIndex($i);
+                    $entryLower = strtolower($entryName);
+                    if (substr($entryLower, -4) === '.xml') {
+                        $xmlRaw = $zip->getFromIndex($i);
+                        if ($xmlRaw !== false) {
+                            $xmls[] = [$xmlRaw, $entryName];
+                        }
+                    } elseif (substr($entryLower, -3) === '.gz') {
+                        $gzRaw = $zip->getFromIndex($i);
+                        if ($gzRaw !== false) {
+                            $xmlRaw = gzdecode($gzRaw);
+                            if ($xmlRaw !== false) {
+                                $xmls[] = [$xmlRaw, $entryName];
+                            }
                         }
                     }
                 }
-
-                if($structure->parts[$i]->ifparameters) 
-                {
-                    foreach($structure->parts[$i]->parameters as $object) 
-                    {
-                        if(strtolower($object->attribute) == 'name') 
-                        {
-                            $attachments[$i]['is_attachment'] = true;
-                            $attachments[$i]['name'] = $object->value;
-                        }
-                    }
-                }
-
-                if($attachments[$i]['is_attachment']) 
-                {
-                    $attachments[$i]['attachment'] = imap_fetchbody($inbox, $email_number, $i+1);
-
-                    /* 3 = BASE64 encoding */
-                    if($structure->parts[$i]->encoding == 3) 
-                    { 
-                        $attachments[$i]['attachment'] = base64_decode($attachments[$i]['attachment']);
-                    }
-                    /* 4 = QUOTED-PRINTABLE encoding */
-                    elseif($structure->parts[$i]->encoding == 4) 
-                    { 
-                        $attachments[$i]['attachment'] = quoted_printable_decode($attachments[$i]['attachment']);
-                    }
-                }
+                $zip->close();
+            } else {
+                log_warn('    Unable to open zip: ' . $filename);
             }
+        } else {
+            log_debug('    Skipping unsupported file: ' . $filename);
         }
+        foreach ($xmls as [$xmlRaw, $entryName]) {
+            $STATS['attachments_seen']++;
+            $xml = @simplexml_load_string($xmlRaw);
+            if ($xml === false) {
+                $STATS['xml_failed']++;
+                log_warn('    Xml load failed in ' . $entryName . ' skipping...');
+                continue;
+            }
+            $xmlData = readXmlData($xml);
+            storeXmlData($xmlData,$xmlRaw);
+            $STATS['xml_parsed']++;
+        }
+    }
+    emitSummaryAndExit(0);
+}
 
-        /* iterate through each attachment */
-        foreach($attachments as $attachment)
-        {
-            if($attachment['is_attachment'] == 1)
-            {
-                $filename = $attachment['name'];
-                if(empty($filename)) $filename = $attachment['filename'];
+/* IMAP import mode using Webklex/php-imap (no ext-imap required) */
 
-                $folder = "attachment";
-                if(!is_dir($folder))
-                {
-                     mkdir($folder);
-                }
+// Parse legacy $host string like 'localhost:143/imap/tls/novalidate-cert'
+$imapHost = 'localhost';
+$imapPort = 143;
+$encryption = null; // 'ssl' | 'tls' | null
+$validateCert = true;
+$protocol = 'imap';
+if (isset($host) && is_string($host)) {
+    // remove surrounding braces if passed like "{host:port/imap/...}"
+    $trim = trim($host);
+    $trim = preg_replace('/^[{](.*)[}]$/', '$1', $trim);
+    $parts = explode('/', $trim);
+    // host:port part
+    if (isset($parts[0]) && $parts[0] !== '') {
+        $hp = explode(':', $parts[0], 2);
+        $imapHost = $hp[0];
+        if (isset($hp[1]) && ctype_digit($hp[1])) {
+            $imapPort = (int)$hp[1];
+        }
+    }
+    foreach ($parts as $p) {
+        $p = strtolower($p);
+        if ($p === 'imap' || $p === 'imap4') { $protocol = 'imap'; }
+        if ($p === 'pop3' || $p === 'pop') { $protocol = 'pop3'; }
+        if ($p === 'ssl') { $encryption = 'ssl'; if ($imapPort === 143) $imapPort = 993; }
+        if ($p === 'tls') { $encryption = 'tls'; }
+        if ($p === 'novalidate-cert') { $validateCert = false; }
+    }
+}
 
-                logMessage('  Processing attachment: ' . $filename);
+try {
+    $cm = new ClientManager();
+    $client = $cm->make([
+        'host'          => $imapHost,
+        'port'          => $imapPort,
+        'encryption'    => $encryption,      // 'ssl', 'tls', or null
+        'validate_cert' => $validateCert,
+        'username'      => $username,
+        'password'      => $password,
+        'protocol'      => $protocol,         // 'imap'
+        'options'       => [
+            'fetch_order' => 'desc',          // newest first
+        ],
+    ]);
+    log_info('Connecting to IMAP ' . $imapHost . ':' . $imapPort . ' protocol=' . $protocol . ' enc=' . ($encryption ?: 'none'));
+    $client->connect();
+} catch (Throwable $e) {
+    log_error('Cannot connect to Email: ' . $e->getMessage());
+    emitSummaryAndExit(1);
+}
 
-                if (preg_match('/.zip$/i',$filename)) {
-                    // ******************* ZIP FILE *******************
-                    $fp = fopen("./". $folder ."/". $email_number . "-" . $filename, "w+");
-                    fwrite($fp, $attachment['attachment']);
-                    fclose($fp);
-                    
-                    $zip = new ZipArchive;
-                    $zip->open('./' . $folder . '/' . $email_number . '-' . $filename);
+try {
+    $inbox = $client->getFolder($folderInbox);
+} catch (Throwable $e) {
+    log_error('Cannot open folder ' . $folderInbox . ': ' . $e->getMessage());
+    emitSummaryAndExit(1);
+}
+
+$STATS['mode'] = 'imap';
+$messages = $inbox->messages()->all()->get();
+log_info('IMAP message count: ' . $messages->count());
+
+if ($messages->count() > 0) {
+    foreach ($messages as $message) {
+        $STATS['messages_seen']++;
+        $subject = $message->getSubject();
+        log_info('Processing message...  Subject:"' . $subject . '"');
+
+        // iterate attachments (ZIP/GZ expected)
+        $attachments = $message->getAttachments();
+        foreach ($attachments as $att) {
+            $STATS['attachments_seen']++;
+            $filename = $att->getName();
+            if (!$filename) { $filename = 'attachment.bin'; }
+            log_info('  Processing attachment: ' . $filename);
+
+            $data = $att->getContent();
+
+            if (preg_match('/\.zip$/i', $filename)) {
+                // ZIP: save to temp and read first entry
+                $tmp = tempnam(sys_get_temp_dir(), 'dmarc_zip_');
+                file_put_contents($tmp, $data);
+                $zip = new ZipArchive();
+                if ($zip->open($tmp) === true && $zip->numFiles > 0) {
                     $xmlFilename = $zip->getNameIndex(0);
+                    $xmlRaw = $zip->getFromIndex(0);
                     $zip->close();
-                    $xmlRaw = file_get_contents('zip://./' . $folder . '/' . $email_number . '-' . $filename . '#' . $xmlFilename);
-                    $xml = simplexml_load_string($xmlRaw);
-                    unlink('./' . $folder . '/' . $email_number . '-' . $filename);
-                } elseif(preg_match('/.gz$/i',$filename)) {
-                    // ******************* GZIP FILE *******************
-                    $xmlRaw = gzdecode($attachment['attachment']);
-                    $xml = simplexml_load_string($xmlRaw);
+                    @unlink($tmp);
+                    $xml = @simplexml_load_string($xmlRaw);
+                    if ($xml === false) {
+                        $STATS['xml_failed']++;
+                        log_warn('    Xml load failed attachment ' . $filename . ' skipping...');
+                        continue;
+                    }
+                    $xmlData = readXmlData($xml);
+                    storeXmlData($xmlData,$xmlRaw);
+                    $STATS['xml_parsed']++;
                 } else {
-                    logMessage('    Unknown attachment ' . $filename . ' skipping...');
+                    @unlink($tmp);
+                    log_warn('    Unable to open zip: ' . $filename);
                     continue;
                 }
+            } elseif (preg_match('/\.gz$/i', $filename)) {
+                $xmlRaw = gzdecode($data);
+                $xml = @simplexml_load_string($xmlRaw);
                 if ($xml === false) {
-                    logMessage('    Xml load failed attachment ' . $filename . ' skipping...');
+                    $STATS['xml_failed']++;
+                    log_warn('    Xml load failed attachment ' . $filename . ' skipping...');
                     continue;
                 }
                 $xmlData = readXmlData($xml);
                 storeXmlData($xmlData,$xmlRaw);
+                $STATS['xml_parsed']++;
+            } elseif (preg_match('/\.xml$/i', $filename)) {
+                $xmlRaw = $data;
+                $xml = @simplexml_load_string($xmlRaw);
+                if ($xml === false) {
+                    $STATS['xml_failed']++;
+                    log_warn('    Xml load failed attachment ' . $filename . ' skipping...');
+                    continue;
+                }
+                $xmlData = readXmlData($xml);
+                storeXmlData($xmlData,$xmlRaw);
+                $STATS['xml_parsed']++;
+            } else {
+                log_debug('    Unknown attachment ' . $filename . ' skipping...');
+                continue;
             }
         }
-        if (imap_mail_move($inbox,$email_number,$folderProcessed)) {
-            imap_expunge($inbox);
+
+        // Move message to processed folder if configured
+        if (!empty($folderProcessed)) {
+            try {
+                $message->move($folderProcessed);
+                $STATS['messages_moved']++;
+            } catch (Throwable $e) {
+                // Try to create the folder and move again
+                try {
+                    $client->createFolder($folderProcessed);
+                    $message->move($folderProcessed);
+                    $STATS['messages_moved']++;
+                } catch (Throwable $e2) {
+                    log_warn('    Unable to move message to ' . $folderProcessed . ': ' . $e2->getMessage());
+                }
+            }
         }
     }
-} 
+}
 
-/* close the connection */
-imap_close($inbox);
-
-logMessage('done.');
+emitSummaryAndExit(0);
 
 function readXmlData($xml) {
     $xmlData['dateFrom'] = (int)$xml->report_metadata->date_range->begin;
@@ -252,14 +343,15 @@ function readXmlData($xml) {
 }
 
 function storeXmlData($xmlData,$xmlRaw) {
-    global $dbc;
+    global $dbc, $STATS;
     // check if report already exists
     $queryCheck = $dbc->prepare('SELECT serial AS count FROM report WHERE reportid=? AND domain=?');
     $parametersCheck[] = $xmlData['reportId'];
     $parametersCheck[] = $xmlData['domain'];
     $queryCheck->execute($parametersCheck);
     if ($queryCheck->fetch()) {
-        logMessage('    Report already exists. reportId: ' . $xmlData['reportId'] . ' domain: ' . $xmlData['domain'] . ' skipping...');
+        $STATS['reports_skipped_existing']++;
+        log_debug('    Report already exists. reportId: ' . $xmlData['reportId'] . ' domain: ' . $xmlData['domain'] . ' skipping...');
         return;
     }
 
@@ -280,10 +372,11 @@ function storeXmlData($xmlData,$xmlRaw) {
     $parametersReport[] = (strlen($xmlData['policy_pct']) > 0) ? $xmlData['policy_pct'] : NULL;
     $parametersReport[] = base64_encode(gzencode($xmlRaw));
     if (!$queryReport->execute($parametersReport)) {
-        logMessage('INSERT INTO report failed. VALUES: ' . json_encode($parametersReport));
+        log_error('INSERT INTO report failed.');
         return;
     }
     $serial = $dbc->lastInsertId();
+    $STATS['reports_inserted']++;
 
     //insert rptrecord
     foreach ($xmlData['record'] as $record) {
@@ -320,8 +413,9 @@ function storeXmlData($xmlData,$xmlRaw) {
         $parametersReportRecord[] = $record['spfResult'];
         $parametersReportRecord[] = $record['hfrom'];
         if (!$queryReportRecord->execute($parametersReportRecord)) {
-            logMessage('INSERT INTO rptrecord failed. VALUES: ' . json_encode($parametersReportRecord));
+            log_warn('INSERT INTO rptrecord failed.');
         }
+        else { $STATS['records_inserted']++; }
     }
 }
 
@@ -381,13 +475,47 @@ function createTableRptrecord() {
     }
 }
 
-function logMessage($message) {
-    echo($message . PHP_EOL);
-    file_put_contents('./import.log',$message . PHP_EOL,FILE_APPEND);
+function log_error($msg) { global $__LOG_LEVEL, $__LOG_LEVELS, $logFile, $logToStdout, $STATS; $STATS['errors']++; log_write('ERROR', $msg, 0); }
+function log_warn($msg)  { log_write('WARN',  $msg, 1); }
+function log_info($msg)  { log_write('INFO',  $msg, 2); }
+function log_debug($msg) { log_write('DEBUG', $msg, 3); }
+
+function logMessage($message) { // backward compat
+    log_info($message);
 }
 
-function resetLog() {
-    file_put_contents('./import.log','');
+function log_write($levelName, $msg, $levelNum) {
+    global $__LOG_LEVEL, $logFile, $logToStdout;
+    if ($levelNum > $__LOG_LEVEL) return;
+    $line = '[' . date('Y-m-d H:i:s') . '] ' . $levelName . ' ' . $msg . PHP_EOL;
+    if ($logToStdout) {
+        echo $line;
+    }
+    if ($logFile) {
+        @file_put_contents($logFile, $line, FILE_APPEND);
+    }
+}
+
+function resetLog($logFilePath) {
+    if ($logFilePath) {
+        @file_put_contents($logFilePath, '');
+    }
+}
+
+function emitSummaryAndExit($code) {
+    global $STATS;
+    $summary = 'done. summary: mode=' . ($STATS['mode'] ?? 'unknown') .
+        ' messages=' . $STATS['messages_seen'] .
+        ' attachments=' . $STATS['attachments_seen'] .
+        ' xml_parsed=' . $STATS['xml_parsed'] .
+        ' xml_failed=' . $STATS['xml_failed'] .
+        ' reports_inserted=' . $STATS['reports_inserted'] .
+        ' reports_skipped=' . $STATS['reports_skipped_existing'] .
+        ' records_inserted=' . $STATS['records_inserted'] .
+        ' messages_moved=' . $STATS['messages_moved'] .
+        ' errors=' . $STATS['errors'];
+    log_info($summary);
+    exit($code);
 }
 
 ?>

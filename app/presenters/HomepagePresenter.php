@@ -11,7 +11,7 @@ class HomepagePresenter extends Nette\Application\UI\Presenter
 
     private $database;
 
-    public function __construct(Nette\Database\Context $database)
+    public function __construct(Nette\Database\Explorer $database)
     {
         $this->database = $database;
     }
@@ -314,15 +314,19 @@ class HomepagePresenter extends Nette\Application\UI\Presenter
             }
             if (isset($filter['dateFrom'])) {
                 $this->template->dateFrom = $filter['dateFrom'];
-                $dateFrom = explode('.',$filter['dateFrom']);
-                $queryParameters[] = implode('/',array($dateFrom[2],$dateFrom[1],$dateFrom[0]));
-                $query .= " maxdate>=? AND";
+                $df = self::parseInputDate($filter['dateFrom']);
+                if ($df !== null) {
+                    $queryParameters[] = $df->format('Y-m-d 00:00:00');
+                    $query .= " maxdate>=? AND";
+                }
             }
             if (isset($filter['dateTo'])) {
                 $this->template->dateTo = $filter['dateTo'];
-                $dateTo = explode('.',$filter['dateTo']);
-                $queryParameters[] = implode('/',array($dateTo[2],$dateTo[1],$dateTo[0])) . ' 23:59:00';
-                $query .= " maxdate<=? AND";
+                $dt = self::parseInputDate($filter['dateTo']);
+                if ($dt !== null) {
+                    $queryParameters[] = $dt->format('Y-m-d 23:59:59');
+                    $query .= " maxdate<=? AND";
+                }
             }
             if (isset($filter['ipAddress'])) {
                 $queryParameters[] = ip2long($filter['ipAddress']);
@@ -370,6 +374,26 @@ class HomepagePresenter extends Nette\Application\UI\Presenter
         } else {
             $this->template->data = NULL;
         }
+    }
+
+    private static function parseInputDate($value): ?\DateTimeImmutable
+    {
+        if (!is_string($value) || $value === '') {
+            return null;
+        }
+        // Accept both d.m.Y and d.m.y from jQuery UI
+        $formats = ['d.m.Y', 'd.m.y'];
+        foreach ($formats as $fmt) {
+            $dt = \DateTimeImmutable::createFromFormat($fmt, $value);
+            if ($dt instanceof \DateTimeImmutable) {
+                // Normalize invalid dates will return false; also check for warnings
+                $errors = \DateTimeImmutable::getLastErrors();
+                if (!$errors || ($errors['warning_count'] ?? 0) === 0 && ($errors['error_count'] ?? 0) === 0) {
+                    return $dt;
+                }
+            }
+        }
+        return null;
     }
 
 	// **************************************** Load xml data ****************************************

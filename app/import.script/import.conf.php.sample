@@ -11,6 +11,19 @@ $password = 'password';
 $folderInbox = 'INBOX';
 $folderProcessed = 'Processed';
 
+// Import source. Options: 'imap' (default) or 'local'.
+// When set to 'local', the script will import all .zip, .gz and .xml files from the directory below.
+// This allows running the importer without the php-imap extension on modern PHP versions.
+$source = 'imap';
+$localPath = __DIR__ . '/incoming';
+
+// Logging configuration
+// Levels: 'error' (least verbose), 'warn', 'info', 'debug' (most verbose)
+// You can override these via CLI flags: -q/--quiet, -v, -vv, --log-level=LEVEL, --log-file=PATH, --no-stdout
+$logLevel = 'info';
+$logFile = __DIR__ . '/import.log';
+$logToStdout = true;
+
 // connect to database with your credentials 
 $dbname = 'dmarc';
 $dbuser = 'dmarc';
